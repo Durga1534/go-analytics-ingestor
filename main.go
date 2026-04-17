@@ -36,7 +36,7 @@ func main() {
 		log.Fatal("REDIS_URL is not set in .env file")
 	}
 	//1 Safety: Intialize Redis and chexk connection
-	opt, err := redis.ParseURL("")
+	opt, err := redis.ParseURL(redisURL)
 	if err != nil {
 		log.Fatalf("Failed to parse Redis URL: %v", err)
 	}
