@@ -94,22 +94,51 @@ func ingestHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func startWorker() {
-	fmt.Println("Worker active: Listeninng for events...")
-	for {
-		result, err := rdb.BLPop(ctx, 0, "analytics_queue").Result()
-		if err != nil {
-			log.Printf("Worker Error: %v", err)
-			time.Sleep(2 * time.Second)
-			continue
-		}
-		var e Event
-		if err := json.Unmarshal([]byte(result[1]), &e); err != nil {
-			log.Printf("Failed to unmarshal event: %v", err)
-			continue
-		}
-		processEvent(e)
+	fmt.Println("Worker active: Batching enabled (Max 10 events or 10s)...")
 
+	const batchSize = 10
+	var batch []Event
+
+	// Create a channel to pipe events from Redis to our select block
+	eventChan := make(chan Event)
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	// Helper Goroutine: Fetch from Redis and pipe to the channel
+	go func() {
+		for {
+			result, err := rdb.BLPop(ctx, 0, "analytics_queue").Result()
+			if err != nil {
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			var e Event
+			if err := json.Unmarshal([]byte(result[1]), &e); err != nil {
+				eventChan <- e
+			}
+		}
+	}()
+
+	for {
+		select {
+		case e := <-eventChan:
+			batch = append(batch, e)
+			if len(batch) >= batchSize {
+				flush(batch)
+				batch = nil
+			}
+		case <-ticker.C:
+			if len(batch) > 0 {
+				fmt.Print("(Timer Flush)")
+				flush(batch)
+				batch = nil
+			}
+		}
 	}
+}
+
+func flush(b []Event) {
+	fmt.Printf("Batch Processed: %d events\n", len(b))
 }
 
 func processEvent(e Event) {
