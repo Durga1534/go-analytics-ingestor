@@ -7,12 +7,16 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
 )
 
+// Event matches your JSON analytics payload
 type Event struct {
 	ID        string    `json:"id"`
 	Type      string    `json:"type"`
@@ -21,90 +25,107 @@ type Event struct {
 }
 
 var (
-	rdb *redis.Client
-	ctx = context.Background() // Global Context for simple use cases
+	rdb    *redis.Client
+	dbPool *pgxpool.Pool
+	ctx    = context.Background()
 )
 
 func main() {
-	err := godotenv.Load()
-	if err != nil {
-		log.Println("No .env file found, proceeding with system evv variables")
+	// Load environment variables
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found, using system environment variables")
 	}
 
+	// 1. Redis Setup
 	redisURL := os.Getenv("REDIS_URL")
 	if redisURL == "" {
-		log.Fatal("REDIS_URL is not set in .env file")
+		log.Fatal("REDIS_URL is not set")
 	}
-	//1 Safety: Intialize Redis and chexk connection
+
 	opt, err := redis.ParseURL(redisURL)
 	if err != nil {
 		log.Fatalf("Failed to parse Redis URL: %v", err)
 	}
 	rdb = redis.NewClient(opt)
 
-	// Verify connection (Safety First)
 	if _, err := rdb.Ping(ctx).Result(); err != nil {
-		log.Fatalf("Could not connect to Upstash: %v", err)
+		log.Fatalf("Could not connect to Redis: %v", err)
 	}
-	fmt.Println("Successfully connected to Upstash Redis!")
+	fmt.Println("✅ Connected to Redis (Upstash)")
 
-	//2 Start the consumer (The Worker)
-	go startWorker()
+	// 2. PostgreSQL Connection Pool
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL != "" {
+		var dberr error
+		dbPool, dberr = pgxpool.New(ctx, dbURL)
+		if dberr != nil {
+			log.Fatalf("Unable to connect to database: %v", dberr)
+		}
+		defer dbPool.Close()
+		fmt.Println("✅ Connected to PostgreSQL Pool")
+	}
 
+	// 3. Setup Routes
 	http.HandleFunc("/ingest", ingestHandler)
 
-	fmt.Println("Server starting on :8080...")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	// 4. Start Background Worker
+	go startWorker()
+
+	// 5. Dynamic Port Logic & Server Start
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080" // Default if not specified in .env
+	}
+
+	go func() {
+		fmt.Printf("🚀 Server starting on :%s...\n", port)
+		if err := http.ListenAndServe(":"+port, nil); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %s", err)
+		}
+	}()
+
+	// 6. Graceful Shutdown Listener
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	<-stop // Block here until Ctrl+C
+	fmt.Println("\nShutting down gracefully...")
 }
 
 func ingestHandler(w http.ResponseWriter, r *http.Request) {
-	//1. Only allow POST requests
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	//2. Efficently decode the body
 	var e Event
-	decoder := json.NewDecoder(r.Body)
-	if err := decoder.Decode(&e); err != nil {
-		// The 'Fix': Handle bad JSON without panicking
+	if err := json.NewDecoder(r.Body).Decode(&e); err != nil {
 		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
-		return
-	}
-	payload, _ := json.Marshal(e)
-	err := rdb.LPush(ctx, "analytics_queue", payload).Err()
-	if err != nil {
-		log.Printf("Redis Push Error: %v", err)
-		http.Error(w, "Failed to queue event", http.StatusInternalServerError)
 		return
 	}
 	defer r.Body.Close()
 
-	//3. Send 202 Accepted immediately
+	payload, _ := json.Marshal(e)
+	if err := rdb.LPush(ctx, "analytics_queue", payload).Err(); err != nil {
+		log.Printf("Redis Error: %v", err)
+		http.Error(w, "Queue failure", http.StatusInternalServerError)
+		return
+	}
+
 	w.WriteHeader(http.StatusAccepted)
-	w.Write([]byte("Event accepted"))
-
-	//4. Fire and forget the background processing
-	go func(event Event) {
-		// Simulate background check
-		processEvent(event)
-
-	}(e)
+	w.Write([]byte("Event accepted and queued"))
 }
 
 func startWorker() {
-	fmt.Println("Worker active: Batching enabled (Max 10 events or 10s)...")
+	fmt.Println("👷 Worker active: Batching 10 events or 10s")
 
 	const batchSize = 10
 	var batch []Event
 
-	// Create a channel to pipe events from Redis to our select block
 	eventChan := make(chan Event)
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
-	// Helper Goroutine: Fetch from Redis and pipe to the channel
 	go func() {
 		for {
 			result, err := rdb.BLPop(ctx, 0, "analytics_queue").Result()
@@ -112,8 +133,9 @@ func startWorker() {
 				time.Sleep(1 * time.Second)
 				continue
 			}
+
 			var e Event
-			if err := json.Unmarshal([]byte(result[1]), &e); err != nil {
+			if err := json.Unmarshal([]byte(result[1]), &e); err == nil {
 				eventChan <- e
 			}
 		}
@@ -127,9 +149,10 @@ func startWorker() {
 				flush(batch)
 				batch = nil
 			}
+
 		case <-ticker.C:
 			if len(batch) > 0 {
-				fmt.Print("(Timer Flush)")
+				fmt.Print("(Timer Flush) ")
 				flush(batch)
 				batch = nil
 			}
@@ -137,10 +160,27 @@ func startWorker() {
 	}
 }
 
-func flush(b []Event) {
-	fmt.Printf("Batch Processed: %d events\n", len(b))
-}
+func flush(batch []Event) {
+	if len(batch) == 0 {
+		return
+	}
 
-func processEvent(e Event) {
-	fmt.Printf("Worker Processed: %s | Type: %s\n", e.ID, e.Type)
+	// High performance batch insert: 1 trip to the DB
+	query := `INSERT INTO analytics (id, type, payload, timestamp) VALUES `
+	values := []interface{}{}
+
+	for i, e := range batch {
+		p := i * 4
+		// Fixed: Added missing comma between first and second placeholder
+		query += fmt.Sprintf("($%d, $%d, $%d, $%d),", p+1, p+2, p+3, p+4)
+		values = append(values, e.ID, e.Type, e.Payload, e.Timestamp)
+	}
+	query = query[:len(query)-1] // Remove trailing comma
+
+	_, err := dbPool.Exec(ctx, query, values...)
+	if err != nil {
+		log.Printf("Database Batch Insert Error: %v", err)
+	} else {
+		fmt.Printf("Successfully persisted batch of %d events to PostgreSQL\n", len(batch))
+	}
 }
