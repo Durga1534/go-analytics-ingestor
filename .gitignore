@@ -1,0 +1,9 @@
+# Credentials
+.env
+
+# Binaries
+*.exe
+go-analytics-ingestor
+
+# IDEs
+.vscode/
