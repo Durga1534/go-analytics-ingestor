@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog" // Structured Logging
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
+	"sync/atomic" // For thread-safe metrics
 	"syscall"
 	"time"
 
@@ -24,72 +26,100 @@ type Event struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
+// SystemMetrics tracks the "Health" of your application
+type SystemMetrics struct {
+	EventsProcessed int64  `json:"events_processed"`
+	QueueLength     int64  `json:"queue_length"`
+	MemoryUsageMB   uint64 `json:"memory_usage_mb"`
+	UptimeSeconds   int64  `json:"uptime_seconds"`
+}
+
 var (
-	rdb    *redis.Client
-	dbPool *pgxpool.Pool
-	ctx    = context.Background()
+	rdb       *redis.Client
+	dbPool    *pgxpool.Pool
+	ctx       = context.Background()
+	startTime = time.Now()
+	logger    *slog.Logger
+
+	// Atomic counters for thread-safe metrics
+	processedCount int64
 )
 
 func main() {
-	// Load environment variables
+	// 1. Initialize Structured Logger
+	// In production, you'd use slog.NewJSONHandler(os.Stdout, nil)
+	logger = slog.New(slog.NewTextHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
+
 	if err := godotenv.Load(); err != nil {
-		log.Println("No .env file found, using system environment variables")
+		logger.Warn("No .env file found, using system environment variables")
 	}
 
-	// 1. Redis Setup
+	// 2. Redis Setup
 	redisURL := os.Getenv("REDIS_URL")
-	if redisURL == "" {
-		log.Fatal("REDIS_URL is not set")
-	}
-
-	opt, err := redis.ParseURL(redisURL)
-	if err != nil {
-		log.Fatalf("Failed to parse Redis URL: %v", err)
-	}
+	opt, _ := redis.ParseURL(redisURL)
 	rdb = redis.NewClient(opt)
-
 	if _, err := rdb.Ping(ctx).Result(); err != nil {
-		log.Fatalf("Could not connect to Redis: %v", err)
+		logger.Error("Could not connect to Redis", "error", err)
+		os.Exit(1)
 	}
-	fmt.Println("✅ Connected to Redis (Upstash)")
+	logger.Info("Connected to Redis", "provider", "Upstash")
 
-	// 2. PostgreSQL Connection Pool
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL != "" {
-		var dberr error
-		dbPool, dberr = pgxpool.New(ctx, dbURL)
-		if dberr != nil {
-			log.Fatalf("Unable to connect to database: %v", dberr)
-		}
-		defer dbPool.Close()
-		fmt.Println("✅ Connected to PostgreSQL Pool")
+	// 3. PostgreSQL Setup
+	var dberr error
+	dbPool, dberr = pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if dberr != nil {
+		logger.Error("Database connection failed", "error", dberr)
+		os.Exit(1)
 	}
+	defer dbPool.Close()
+	logger.Info("Connected to PostgreSQL", "pool", "initialized")
 
-	// 3. Setup Routes
+	// 4. Routes
 	http.HandleFunc("/ingest", ingestHandler)
+	http.HandleFunc("/metrics", metricsHandler)
 
-	// 4. Start Background Worker
-	go startWorker()
+	// 5. Worker & Server Start
+	workerDone := make(chan bool)
+	go startWorker(workerDone)
 
-	// 5. Dynamic Port Logic & Server Start
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080" // Default if not specified in .env
+		port = "8080"
 	}
 
 	go func() {
-		fmt.Printf("🚀 Server starting on :%s...\n", port)
-		if err := http.ListenAndServe(":"+port, nil); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Server error: %s", err)
+		logger.Info("Server starting", "port", port)
+		if err := http.ListenAndServe(":"+port, nil); err != nil {
+			logger.Error("Server crashed", "error", err)
 		}
 	}()
 
-	// 6. Graceful Shutdown Listener
+	// 6. Graceful Shutdown
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
-	<-stop // Block here until Ctrl+C
-	fmt.Println("\nShutting down gracefully...")
+	<-stop
+	logger.Info("Shutdown signal received. Cleaning up...")
+	// In a full production app, you'd trigger a final flush here
+	logger.Info("System offline")
+}
+
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	qLen, _ := rdb.LLen(ctx, "analytics_queue").Result()
+
+	currentMetrics := SystemMetrics{
+		EventsProcessed: atomic.LoadInt64(&processedCount),
+		QueueLength:     qLen,
+		MemoryUsageMB:   m.Alloc / 1024 / 1024,
+		UptimeSeconds:   int64(time.Since(startTime).Seconds()),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(currentMetrics)
 }
 
 func ingestHandler(w http.ResponseWriter, r *http.Request) {
@@ -100,87 +130,78 @@ func ingestHandler(w http.ResponseWriter, r *http.Request) {
 
 	var e Event
 	if err := json.NewDecoder(r.Body).Decode(&e); err != nil {
-		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		logger.Warn("Invalid JSON payload received")
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
-	defer r.Body.Close()
 
 	payload, _ := json.Marshal(e)
 	if err := rdb.LPush(ctx, "analytics_queue", payload).Err(); err != nil {
-		log.Printf("Redis Error: %v", err)
+		logger.Error("Failed to queue event", "id", e.ID, "error", err)
 		http.Error(w, "Queue failure", http.StatusInternalServerError)
 		return
 	}
 
 	w.WriteHeader(http.StatusAccepted)
-	w.Write([]byte("Event accepted and queued"))
 }
 
-func startWorker() {
-	fmt.Println("👷 Worker active: Batching 10 events or 10s")
-
+func startWorker(done chan bool) {
 	const batchSize = 10
 	var batch []Event
-
-	eventChan := make(chan Event)
 	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
 
-	go func() {
-		for {
-			result, err := rdb.BLPop(ctx, 0, "analytics_queue").Result()
+	logger.Info("Worker started", "batch_limit", batchSize, "timer", "10s")
+
+	for {
+		select {
+		case <-ticker.C:
+			if len(batch) > 0 {
+				logger.Info("Timer-based flush triggered", "count", len(batch))
+				flush(batch)
+				batch = nil
+			}
+		default:
+			// Non-blocking fetch from Redis
+			result, err := rdb.BLPop(ctx, 1*time.Second, "analytics_queue").Result()
 			if err != nil {
-				time.Sleep(1 * time.Second)
 				continue
 			}
 
 			var e Event
 			if err := json.Unmarshal([]byte(result[1]), &e); err == nil {
-				eventChan <- e
-			}
-		}
-	}()
-
-	for {
-		select {
-		case e := <-eventChan:
-			batch = append(batch, e)
-			if len(batch) >= batchSize {
-				flush(batch)
-				batch = nil
-			}
-
-		case <-ticker.C:
-			if len(batch) > 0 {
-				fmt.Print("(Timer Flush) ")
-				flush(batch)
-				batch = nil
+				batch = append(batch, e)
+				if len(batch) >= batchSize {
+					logger.Info("Capacity-based flush triggered", "count", len(batch))
+					flush(batch)
+					batch = nil
+				}
 			}
 		}
 	}
 }
 
 func flush(batch []Event) {
-	if len(batch) == 0 {
-		return
-	}
-
-	// High performance batch insert: 1 trip to the DB
 	query := `INSERT INTO analytics (id, type, payload, timestamp) VALUES `
 	values := []interface{}{}
 
 	for i, e := range batch {
 		p := i * 4
-		// Fixed: Added missing comma between first and second placeholder
 		query += fmt.Sprintf("($%d, $%d, $%d, $%d),", p+1, p+2, p+3, p+4)
 		values = append(values, e.ID, e.Type, e.Payload, e.Timestamp)
 	}
-	query = query[:len(query)-1] // Remove trailing comma
+	query = query[:len(query)-1]
 
+	start := time.Now()
 	_, err := dbPool.Exec(ctx, query, values...)
+	duration := time.Since(start)
+
 	if err != nil {
-		log.Printf("Database Batch Insert Error: %v", err)
+		logger.Error("Database batch insert failed", "error", err, "batch_size", len(batch))
 	} else {
-		fmt.Printf("Successfully persisted batch of %d events to PostgreSQL\n", len(batch))
+		atomic.AddInt64(&processedCount, int64(len(batch)))
+		logger.Info("Batch persisted successfully",
+			"count", len(batch),
+			"latency_ms", duration.Milliseconds(),
+			"total_processed", atomic.LoadInt64(&processedCount))
 	}
 }
