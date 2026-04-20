@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog" // Structured Logging
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
-	"sync/atomic" // For thread-safe metrics
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -18,7 +18,8 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Event matches your JSON analytics payload
+// --- MODELS ---
+
 type Event struct {
 	ID        string    `json:"id"`
 	Type      string    `json:"type"`
@@ -26,28 +27,30 @@ type Event struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
-// SystemMetrics tracks the "Health" of your application
 type SystemMetrics struct {
 	EventsProcessed int64  `json:"events_processed"`
-	QueueLength     int64  `json:"queue_length"`
+	StreamPending   int64  `json:"stream_pending"`
 	MemoryUsageMB   uint64 `json:"memory_usage_mb"`
 	UptimeSeconds   int64  `json:"uptime_seconds"`
 }
 
-var (
-	rdb       *redis.Client
-	dbPool    *pgxpool.Pool
-	ctx       = context.Background()
-	startTime = time.Now()
-	logger    *slog.Logger
+// --- GLOBALS ---
 
-	// Atomic counters for thread-safe metrics
+var (
+	rdb            *redis.Client
+	dbPool         *pgxpool.Pool
+	ctx            = context.Background()
+	startTime      = time.Now()
+	logger         *slog.Logger
 	processedCount int64
+
+	// Phase 6 Constants
+	StreamName    = "analytics_stream"
+	ConsumerGroup = "ingestor_group"
+	DLQName       = "analytics_dlq"
 )
 
 func main() {
-	// 1. Initialize Structured Logger
-	// In production, you'd use slog.NewJSONHandler(os.Stdout, nil)
 	logger = slog.New(slog.NewTextHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
@@ -55,72 +58,62 @@ func main() {
 		logger.Warn("No .env file found, using system environment variables")
 	}
 
-	// 2. Redis Setup
-	redisURL := os.Getenv("REDIS_URL")
-	opt, _ := redis.ParseURL(redisURL)
+	// 1. Redis Setup
+	opt, _ := redis.ParseURL(os.Getenv("REDIS_URL"))
 	rdb = redis.NewClient(opt)
-	if _, err := rdb.Ping(ctx).Result(); err != nil {
-		logger.Error("Could not connect to Redis", "error", err)
-		os.Exit(1)
-	}
-	logger.Info("Connected to Redis", "provider", "Upstash")
 
-	// 3. PostgreSQL Setup
-	var dberr error
-	dbPool, dberr = pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
-	if dberr != nil {
-		logger.Error("Database connection failed", "error", dberr)
+	// Phase 6: Initialize Consumer Group
+	// We use MKSTREAM to create the stream if it doesn't exist
+	err := rdb.XGroupCreateMkStream(ctx, StreamName, ConsumerGroup, "$").Err()
+	if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
+		logger.Error("Failed to create consumer group", "error", err)
+	}
+
+	// 2. Postgres Setup
+	dbPool, err = pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		logger.Error("Database connection failed", "error", err)
 		os.Exit(1)
 	}
 	defer dbPool.Close()
-	logger.Info("Connected to PostgreSQL", "pool", "initialized")
 
-	// 4. Routes
+	// 3. Worker Configuration (Scaleable via hostname)
+	workerName, _ := os.Hostname()
+	if workerName == "" {
+		workerName = "local-worker"
+	}
+
+	// Start Distributed Worker
+	go startDistributedWorker(workerName)
+
+	// 4. API Routes
 	http.HandleFunc("/ingest", ingestHandler)
 	http.HandleFunc("/metrics", metricsHandler)
-
-	// 5. Worker & Server Start
-	workerDone := make(chan bool)
-	go startWorker(workerDone)
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
+	server := &http.Server{Addr: ":" + port}
 	go func() {
-		logger.Info("Server starting", "port", port)
-		if err := http.ListenAndServe(":"+port, nil); err != nil {
+		logger.Info("Distributed Engine Starting", "port", port, "worker", workerName)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("Server crashed", "error", err)
 		}
 	}()
 
-	// 6. Graceful Shutdown
+	// 5. Graceful Shutdown
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-
 	<-stop
-	logger.Info("Shutdown signal received. Cleaning up...")
-	// In a full production app, you'd trigger a final flush here
+
+	logger.Info("Shutdown signal received. Closing connections...")
+	server.Shutdown(ctx)
 	logger.Info("System offline")
 }
 
-func metricsHandler(w http.ResponseWriter, r *http.Request) {
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-
-	qLen, _ := rdb.LLen(ctx, "analytics_queue").Result()
-
-	currentMetrics := SystemMetrics{
-		EventsProcessed: atomic.LoadInt64(&processedCount),
-		QueueLength:     qLen,
-		MemoryUsageMB:   m.Alloc / 1024 / 1024,
-		UptimeSeconds:   int64(time.Since(startTime).Seconds()),
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(currentMetrics)
-}
+// --- HANDLERS ---
 
 func ingestHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -130,57 +123,113 @@ func ingestHandler(w http.ResponseWriter, r *http.Request) {
 
 	var e Event
 	if err := json.NewDecoder(r.Body).Decode(&e); err != nil {
-		logger.Warn("Invalid JSON payload received")
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
 
+	// Phase 6: Write to Stream instead of List
+	// This allows multiple consumers to read the same data if needed
 	payload, _ := json.Marshal(e)
-	if err := rdb.LPush(ctx, "analytics_queue", payload).Err(); err != nil {
-		logger.Error("Failed to queue event", "id", e.ID, "error", err)
-		http.Error(w, "Queue failure", http.StatusInternalServerError)
+	err := rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: StreamName,
+		Values: map[string]interface{}{"payload": string(payload)},
+	}).Err()
+
+	if err != nil {
+		logger.Error("Failed to stream event", "error", err)
+		http.Error(w, "Ingestion failure", http.StatusInternalServerError)
 		return
 	}
 
 	w.WriteHeader(http.StatusAccepted)
 }
 
-func startWorker(done chan bool) {
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	// Check Stream Pending count
+	groups, _ := rdb.XInfoGroups(ctx, StreamName).Result()
+	var pending int64
+	if len(groups) > 0 {
+		pending = groups[0].Pending
+	}
+
+	json.NewEncoder(w).Encode(SystemMetrics{
+		EventsProcessed: atomic.LoadInt64(&processedCount),
+		StreamPending:   pending,
+		MemoryUsageMB:   m.Alloc / 1024 / 1024,
+		UptimeSeconds:   int64(time.Since(startTime).Seconds()),
+	})
+}
+
+// --- DISTRIBUTED WORKER LOGIC ---
+
+func startDistributedWorker(name string) {
 	const batchSize = 10
-	var batch []Event
 	ticker := time.NewTicker(10 * time.Second)
 
-	logger.Info("Worker started", "batch_limit", batchSize, "timer", "10s")
+	var batch []Event
+	var messageIDs []string
+
+	logger.Info("Distributed worker ready", "consumer_name", name)
 
 	for {
 		select {
 		case <-ticker.C:
 			if len(batch) > 0 {
-				logger.Info("Timer-based flush triggered", "count", len(batch))
-				flush(batch)
-				batch = nil
+				logger.Info("Timer-based flush", "count", len(batch))
+				if flushAndAck(batch, messageIDs) {
+					batch = nil
+					messageIDs = nil
+				}
 			}
 		default:
-			// Non-blocking fetch from Redis
-			result, err := rdb.BLPop(ctx, 1*time.Second, "analytics_queue").Result()
+			// Read from the group
+			// ">" means: "New messages never delivered to others"
+			entries, err := rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+				Group:    ConsumerGroup,
+				Consumer: name,
+				Streams:  []string{StreamName, ">"},
+				Count:    batchSize,
+				Block:    2 * time.Second,
+			}).Result()
+
 			if err != nil {
 				continue
 			}
 
-			var e Event
-			if err := json.Unmarshal([]byte(result[1]), &e); err == nil {
-				batch = append(batch, e)
-				if len(batch) >= batchSize {
-					logger.Info("Capacity-based flush triggered", "count", len(batch))
-					flush(batch)
+			for _, stream := range entries {
+				for _, msg := range stream.Messages {
+					var e Event
+					data := msg.Values["payload"].(string)
+
+					if err := json.Unmarshal([]byte(data), &e); err != nil {
+						// DEAD LETTER QUEUE (DLQ)
+						logger.Error("Poison pill detected. Moving to DLQ", "data", data)
+						rdb.LPush(ctx, DLQName, data)
+						rdb.XAck(ctx, StreamName, ConsumerGroup, msg.ID) // Ack to remove from stream
+						continue
+					}
+
+					batch = append(batch, e)
+					messageIDs = append(messageIDs, msg.ID)
+				}
+			}
+
+			if len(batch) >= batchSize {
+				logger.Info("Capacity-based flush", "count", len(batch))
+				if flushAndAck(batch, messageIDs) {
 					batch = nil
+					messageIDs = nil
 				}
 			}
 		}
 	}
 }
 
-func flush(batch []Event) {
+func flushAndAck(batch []Event, ids []string) bool {
+	// Build Batch Insert Query
 	query := `INSERT INTO analytics (id, type, payload, timestamp) VALUES `
 	values := []interface{}{}
 
@@ -191,17 +240,21 @@ func flush(batch []Event) {
 	}
 	query = query[:len(query)-1]
 
-	start := time.Now()
+	// Execute Persistence
 	_, err := dbPool.Exec(ctx, query, values...)
-	duration := time.Since(start)
-
 	if err != nil {
-		logger.Error("Database batch insert failed", "error", err, "batch_size", len(batch))
-	} else {
-		atomic.AddInt64(&processedCount, int64(len(batch)))
-		logger.Info("Batch persisted successfully",
-			"count", len(batch),
-			"latency_ms", duration.Milliseconds(),
-			"total_processed", atomic.LoadInt64(&processedCount))
+		logger.Error("Database persistence failed", "error", err)
+		return false
 	}
+
+	// ACKNOWLEDGE - The most important part of Phase 6
+	// Only remove from Redis if DB write succeeded
+	err = rdb.XAck(ctx, StreamName, ConsumerGroup, ids...).Err()
+	if err != nil {
+		logger.Error("Failed to ACK messages", "error", err)
+		return false
+	}
+
+	atomic.AddInt64(&processedCount, int64(len(batch)))
+	return true
 }
