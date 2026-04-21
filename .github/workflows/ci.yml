@@ -96,7 +96,7 @@ jobs:
           args: '-no-fail -fmt json -out gosec-report.json ./...'
       
       - name: Upload Gosec Report
-        uses: github/codeql-action/upload-sarif@v2
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: gosec-report.json
         continue-on-error: true
