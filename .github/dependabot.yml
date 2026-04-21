@@ -19,9 +19,6 @@ updates:
     allow:
       - dependency-type: "direct"
       - dependency-type: "indirect"
-    ignore:
-      # Add any dependencies you want to keep pinned
-      # - dependency-name: "package-name"
 
   # GitHub Actions
   - package-ecosystem: "github-actions"

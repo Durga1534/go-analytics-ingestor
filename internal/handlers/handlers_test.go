@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/redis/go-redis/v9"
 	"github.com/Durga1534/go-analytics-ingestor/internal/models"
+	"github.com/redis/go-redis/v9"
 )
 
 func TestIngestHandler(t *testing.T) {
